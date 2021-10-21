@@ -713,7 +713,7 @@ impl LocalSignature {
             .all(|x| x);
 
         let err_type = ErrorType {
-            error_type: "bad gamma_i decommit".to_string(),
+            error_type: "Bad PDLwSlack".to_string(),
             bad_actors: bad_actors_vec,
         };
         if proofs_verification {

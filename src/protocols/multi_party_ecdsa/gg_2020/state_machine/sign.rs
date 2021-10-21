@@ -42,6 +42,8 @@ use crate::utilities::zk_pdl_with_slack::PDLwSlackProof;
 use curv::BigInt;
 use rounds::*;
 pub use rounds::{CompletedOfflineStage, Error as ProceedError, PartialSignature};
+use std::fs::File;
+use std::io::{Write, BufReader, BufRead};
 
 /// Offline Stage of GG20 signing
 ///
@@ -638,7 +640,7 @@ mod test {
     fn simulate_offline_stage(
         local_keys: Vec<LocalKey>,
         s_l: &[u16],
-    ) -> Vec<CompletedOfflineStage> {
+    ) -> Result<Vec<CompletedOfflineStage>, ()> {
         let mut simulation = Simulation::new();
         simulation.enable_benchmarks(true);
 
@@ -653,12 +655,12 @@ mod test {
             );
         }
 
-        let stages = simulation.run().unwrap();
+        let stages = simulation.run().map_err(|_| ())?;
 
         println!("Benchmark results:");
         println!("{:#?}", simulation.benchmark_results().unwrap());
 
-        stages
+        Ok(stages)
     }
 
     fn simulate_signing(offline: Vec<CompletedOfflineStage>, message: &[u8]) {
@@ -689,6 +691,24 @@ mod test {
     }
 
     #[test]
+    fn large_k_attack() {
+        let threshold = 1;
+        let mut local_keys = simulate_keygen(threshold, 3);
+        let mut output = File::create("examples/tmp.txt").unwrap();
+        for _ in 0..threshold {
+            write!(output, "{}", BigInt::from(1).to_hex() + "\n").unwrap();
+        }
+        for i in 1..17 {
+            println!("Sign number {}", i);
+            local_keys[0].t = i;
+            match simulate_offline_stage(local_keys.clone(), &(1..threshold + 2).collect::<Vec<u16>>()) {
+                Ok(_) => println!("Keys generated normally, which should only happen after the first signature"),
+                Err(_) => println!("Signature failed, which is expected"),
+            }
+        }
+    }
+
+    #[test]
     fn simulate_offline_stage_t1_n2_s2() {
         let local_keys = simulate_keygen(1, 2);
         simulate_offline_stage(local_keys, &[1, 2]);
@@ -710,24 +730,24 @@ mod test {
     fn simulate_signing_t1_n2_s2() {
         let local_keys = simulate_keygen(1, 2);
         let offline_stage = simulate_offline_stage(local_keys, &[1, 2]);
-        simulate_signing(offline_stage, b"ZenGo")
+        simulate_signing(offline_stage.unwrap(), b"ZenGo")
     }
 
     #[test]
     fn simulate_signing_t1_n3_s2() {
         let local_keys = simulate_keygen(1, 3);
         let offline_stage = simulate_offline_stage(local_keys.clone(), &[1, 2]);
-        simulate_signing(offline_stage, b"ZenGo");
+        simulate_signing(offline_stage.unwrap(), b"ZenGo");
         let offline_stage = simulate_offline_stage(local_keys.clone(), &[1, 3]);
-        simulate_signing(offline_stage, b"ZenGo");
+        simulate_signing(offline_stage.unwrap(), b"ZenGo");
         let offline_stage = simulate_offline_stage(local_keys.clone(), &[2, 3]);
-        simulate_signing(offline_stage, b"ZenGo");
+        simulate_signing(offline_stage.unwrap(), b"ZenGo");
     }
 
     #[test]
     fn simulate_signing_t2_n3_s3() {
         let local_keys = simulate_keygen(2, 3);
         let offline_stage = simulate_offline_stage(local_keys, &[1, 2, 3]);
-        simulate_signing(offline_stage, b"ZenGo")
+        simulate_signing(offline_stage.unwrap(), b"ZenGo")
     }
 }

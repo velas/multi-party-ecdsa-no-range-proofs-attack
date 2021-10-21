@@ -24,6 +24,15 @@ use gg20::party_i::{
 };
 use gg20::state_machine::keygen::LocalKey;
 use gg20::ErrorType;
+use paillier::{Paillier, RawPlaintext, Decrypt, RawCiphertext, Randomness};
+use curv::elliptic::curves::traits::*;
+use curv::arithmetic::{Integer, BasicOps, Converter, Samplable};
+use paillier::traits::Encrypt;
+use std::ops::Mul;
+use std::fs::File;
+use std::io::{Write, BufReader, BufRead};
+use std::borrow::Borrow;
+use paillier::traits::EncryptWithChosenRandomness;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -67,7 +76,7 @@ impl Round0 {
     where
         O: Push<Msg<(MessageA, SignBroadcastPhase1)>>,
     {
-        let sign_keys = SignKeys::create(
+        let mut sign_keys = SignKeys::create(
             &self.local_key.keys_linear.x_i,
             &self.local_key.vss_scheme.clone(),
             usize::from(self.s_l[usize::from(self.i - 1)]) - 1,
@@ -80,7 +89,21 @@ impl Round0 {
         let (bc1, decom1) = sign_keys.phase1_broadcast();
 
         let party_ek = self.local_key.paillier_key_vec[usize::from(self.local_key.i - 1)].clone();
-        let m_a = MessageA::a(&sign_keys.k_i, &party_ek);
+        let m_a = if self.i > 1 { MessageA::a(&sign_keys.k_i, &party_ek) }
+        // malicious party encrypts large k_i value, chosen in a specific way
+        else {
+            let i = self.local_key.t as u32;
+            let bad_k_1 = self.local_key.paillier_key_vec[0].n
+                .div_floor(&FE::q()).mul(BigInt::from(2).pow(16*i + 1));
+            sign_keys.k_i = ECScalar::from(&bad_k_1);
+            let rand = BigInt::sample_below(&self.local_key.paillier_key_vec[0].n);
+            let c_a = Paillier::encrypt_with_chosen_randomness(
+                &self.local_key.paillier_key_vec[0],
+                RawPlaintext::from(&bad_k_1),
+                &Randomness::from(rand.clone()),
+            );
+            (MessageA { c: c_a.0.clone().into_owned() }, rand)
+        };
 
         output.push(Msg {
             sender: self.i,
@@ -239,21 +262,150 @@ impl Round2 {
             &l_s[..],
             &self.local_key.vss_scheme,
         );
+
+        let mut output_ = None;
+        // number of signature
+        let i = self.local_key.t as u32;
+        let g: GE = ECPoint::generator();
+        let mut r = BigInt::from(0);
+        let mut bad_k_i_fe: FE = FE::zero();
+        let mut bad_k_i = BigInt::from(0);
+        let mut G_j = vec![];
+        let mut w_min = vec![];
+        // we'll put parties' secrets in this vector
+        let mut w_vec = vec![];
+        // if we're the bad party, do stuff to prepare
+        if self.i == 1 {
+            bad_k_i = self.local_key.paillier_key_vec[0].n
+                .div_floor(&FE::q()).mul(BigInt::from(2).pow(16*i + 1));
+            r = self.local_key.paillier_key_vec[0].n
+                .div_rem(&FE::q()).1;
+            // precomputed values, list G in the paper
+            G_j = (1..2_u32.pow(17) + 1).map(|k| {
+                let r_j: BigInt = r.clone()*BigInt::from(k as u32);
+                let r_j_fe: FE = ECScalar::from(&r_j);
+                g * r_j_fe
+            }).collect::<Vec<GE>>();
+            bad_k_i_fe = ECScalar::from(&bad_k_i);
+            // reading values that we saved after previous signatures
+            let input = File::open("examples/tmp.txt").unwrap();
+            let buffered = BufReader::new(input);
+            for line in buffered.lines() {
+                w_min.push(BigInt::from_hex(&line.unwrap()).unwrap());
+            }
+            output_ = Some(File::create("examples/tmp.txt").unwrap());
+        }
+
         for j in 0..ttag - 1 {
             let ind = if j < index { j } else { j + 1 };
             let m_b = m_b_gamma_s[j].clone();
 
-            let alpha_ij_gamma = m_b
+            let alpha_ij_gamma = if self.i > 1 {m_b
                 .verify_proofs_get_alpha(&self.local_key.paillier_dk, &self.sign_keys.k_i)
-                .expect("wrong dlog or m_b");
+                .expect("wrong dlog or m_b") }
+            else {
+                // the first signature we can even complete!
+                if i == 1 {
+                    let alice_share = Paillier::decrypt(&self.local_key.paillier_dk,
+                                                    &RawCiphertext::from(&m_b.c));
+                    let mut real_alpha: FE = ECScalar::from(&alice_share.0);
+                    let g_alpha = g * real_alpha.clone();
+                    let target_ge = m_b.b_proof.pk * bad_k_i_fe +
+                        m_b.beta_tag_proof.pk.sub_point(&g_alpha.get_element());
+                    for (k, &g_j) in G_j.iter().enumerate() {
+                        if target_ge == g_j {
+                            let j_bi_plus_one = BigInt::from(k as u32 + 1_u32);
+                            let j_r: FE = ECScalar::from(&j_bi_plus_one.mul(&r));
+                            real_alpha = real_alpha.add(&j_r.get_element());
+                        }
+                    }
+
+                    let g_real_alpha = g * real_alpha;
+                    assert_eq!(m_b.b_proof.pk * bad_k_i_fe + m_b.beta_tag_proof.pk, g_real_alpha);
+
+                    // this is the actual value that malicious player will use
+                    (real_alpha, real_alpha.to_big_int())
+                }
+                else {
+                    (FE::zero(), BigInt::from(0))
+                }
+            };
             let m_b = m_b_w_s[j].clone();
-            let alpha_ij_wi = m_b
+            let alpha_ij_wi = if self.i > 1 { m_b
                 .verify_proofs_get_alpha(&self.local_key.paillier_dk, &self.sign_keys.k_i)
-                .expect("wrong dlog or m_b");
+                .expect("wrong dlog or m_b") }
+            // malicious party does some processing here
+            else {
+                let alice_share = Paillier::decrypt(&self.local_key.paillier_dk,
+                                                    &RawCiphertext::from(&m_b.c));
+                let alpha: FE = ECScalar::from(&alice_share.0);
+                let mut real_alpha: FE = alpha.clone();
+                let g_alpha = g * alpha;
+                let target_ge = m_b.b_proof.pk * bad_k_i_fe +
+                    m_b.beta_tag_proof.pk.sub_point(&g_alpha.get_element());
+                let two_pow = &BigInt::from(2_u32).pow(16*i+1);
+                let target_ge_i = if i > 1 {
+                    let s = (bad_k_i.clone().mul(w_min[j].clone())
+                        .div_ceil(&self.local_key.paillier_key_vec[0].n)
+                        .mul(&self.local_key.paillier_key_vec[0].n));
+                    let sfe: FE = ECScalar::from(&s);
+                    real_alpha = real_alpha.add(&sfe.get_element());
+                    target_ge.sub_point(&(g * sfe).get_element())
+                }
+                else { target_ge.clone() };
+                let mut w_i = FE::zero();
+
+                // search over precomputed options
+                for (k, &g_j) in G_j.iter().enumerate() {
+                    if target_ge_i == g_j {
+                        let j_bi = BigInt::from(k as u32);
+                        let j_bi_plus_one = BigInt::from(k as u32 + 1_u32);
+                        let mut q_j = if i > 1 { w_min[j].clone() + FE::q().mul(&j_bi).div_floor(two_pow) }
+                            else { FE::q().mul(&j_bi).div_floor(two_pow) };
+                        println!("Range to which party {}'s w_i was reduced by the attacker: [{:?}; {:?}]", j+2, q_j, q_j.add(&FE::q().div_floor(two_pow)));
+                        let j_r: FE = ECScalar::from(&j_bi_plus_one.mul(&r));
+                        real_alpha = real_alpha.add(&j_r.get_element());
+                        // if it is the last iteration, do a quick search over the remaining options:
+                        if i == 16_u32 {
+                            w_i = loop {
+                                let q_j_fe: FE = ECScalar::from(&q_j);
+                                if g * q_j_fe == m_b.b_proof.pk {
+                                    break q_j_fe
+                                }
+                                else { q_j = q_j.add(&BigInt::from(1)) }
+                            }
+                        }
+                        let mut output__ = output_.as_ref().unwrap();
+                        write!(output__, "{}", q_j.to_hex() + "\n").unwrap();
+                    }
+                }
+                w_vec.push(w_i);
+
+                // reconstructing a correct value in MtA only works for the first signature
+                if i == 1 {
+                    let g_real_alpha = g * real_alpha;
+                    assert_eq!(m_b.b_proof.pk * bad_k_i_fe + m_b.beta_tag_proof.pk, g_real_alpha);
+                }
+
+                // this is the actual value malicious player was meant to receive
+                (real_alpha, real_alpha.to_big_int())
+            };
             assert_eq!(m_b.b_proof.pk, g_w_vec[ind]); //TODO: return error
 
             alpha_vec.push(alpha_ij_gamma.0);
             miu_vec.push(alpha_ij_wi.0);
+        }
+        if self.i == 1 {
+            if i == 16
+            {
+                // recovered sk
+                let secret_key = w_vec.iter().fold(self.sign_keys.w_i,
+                                                   |acc, x|
+                                                       acc.add(&x.get_element()));
+                // check that it verifies
+                assert_eq!(g * secret_key, self.local_key.public_key());
+                println!("Secret key successfully recovered! It turns out to be: {}", secret_key.to_big_int());
+            }
         }
 
         let delta_i = self.sign_keys.phase2_delta_i(&alpha_vec, &self.beta_vec);
@@ -507,10 +659,11 @@ impl Round5 {
                 &self.local_key.h1_h2_n_tilde_vec,
                 &l_s,
                 i,
-            )
-            .expect("phase5 verify pdl error");
+            ).map_err(|_| Error::Round6VerifyProof(ErrorType { error_type: "".to_string(), bad_actors: vec![] }));
         }
-        LocalSignature::phase5_check_R_dash_sum(&r_dash_vec).expect("R_dash error");
+        LocalSignature::phase5_check_R_dash_sum(&r_dash_vec).map_err(|_| {
+            Error::Round6VerifyProof(ErrorType { error_type: "R_dash".to_string(), bad_actors: vec![] })
+        })?;
 
         let (S_i, homo_elgamal_proof) = LocalSignature::phase6_compute_S_i_and_proof_of_consistency(
             &self.R,
